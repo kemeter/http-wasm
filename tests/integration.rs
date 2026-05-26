@@ -1,0 +1,152 @@
+//! End-to-end test: compile the fixture guest to wasm, load it through the
+//! host, and assert the ABI round-trips (header read, header add, status,
+//! short-circuit).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+
+use http_wasm_host::{HeaderKind, Host, Limits, Next, Plugin};
+
+/// A self-contained in-memory request/response used to drive a guest.
+#[derive(Default)]
+struct TestHost {
+    method: String,
+    uri: String,
+    status: u32,
+    req_headers: HashMap<String, Vec<String>>,
+    resp_headers: HashMap<String, Vec<String>>,
+    resp_body: Vec<u8>,
+}
+
+impl TestHost {
+    fn with_req_header(mut self, name: &str, value: &str) -> Self {
+        self.req_headers
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(value.to_string());
+        self
+    }
+    fn map(&mut self, kind: HeaderKind) -> &mut HashMap<String, Vec<String>> {
+        match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => &mut self.req_headers,
+            HeaderKind::Response | HeaderKind::ResponseTrailers => &mut self.resp_headers,
+        }
+    }
+}
+
+impl Host for TestHost {
+    fn method(&self) -> String {
+        self.method.clone()
+    }
+    fn set_method(&mut self, m: &str) {
+        self.method = m.to_string();
+    }
+    fn uri(&self) -> String {
+        self.uri.clone()
+    }
+    fn set_uri(&mut self, u: &str) {
+        self.uri = u.to_string();
+    }
+    fn protocol_version(&self) -> String {
+        "HTTP/1.1".to_string()
+    }
+    fn source_addr(&self) -> String {
+        "127.0.0.1:1234".to_string()
+    }
+    fn status_code(&self) -> u32 {
+        self.status
+    }
+    fn set_status_code(&mut self, s: u32) {
+        self.status = s;
+    }
+    fn header_names(&self, kind: HeaderKind) -> Vec<String> {
+        let m = match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => &self.req_headers,
+            HeaderKind::Response | HeaderKind::ResponseTrailers => &self.resp_headers,
+        };
+        m.keys().cloned().collect()
+    }
+    fn header_values(&self, kind: HeaderKind, name: &str) -> Vec<String> {
+        let m = match kind {
+            HeaderKind::Request | HeaderKind::RequestTrailers => &self.req_headers,
+            HeaderKind::Response | HeaderKind::ResponseTrailers => &self.resp_headers,
+        };
+        m.get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn set_header_value(&mut self, kind: HeaderKind, name: &str, value: &str) {
+        self.map(kind)
+            .insert(name.to_ascii_lowercase(), vec![value.to_string()]);
+    }
+    fn add_header_value(&mut self, kind: HeaderKind, name: &str, value: &str) {
+        self.map(kind)
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(value.to_string());
+    }
+    fn remove_header(&mut self, kind: HeaderKind, name: &str) {
+        self.map(kind).remove(&name.to_ascii_lowercase());
+    }
+    fn read_body(&mut self, _kind: HeaderKind, _max: usize) -> Vec<u8> {
+        Vec::new()
+    }
+    fn write_body(&mut self, kind: HeaderKind, data: &[u8]) {
+        if matches!(kind, HeaderKind::Response) {
+            self.resp_body = data.to_vec();
+        }
+    }
+}
+
+/// Compile the fixture guest once per test run and cache the wasm bytes.
+fn guest_wasm() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    WASM.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/guest-headers");
+        let status = Command::new("cargo")
+            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+            .current_dir(&dir)
+            .status()
+            .expect("cargo build for guest");
+        assert!(status.success(), "guest build failed");
+        let wasm = dir.join("target/wasm32-unknown-unknown/release/guest_headers.wasm");
+        std::fs::read(&wasm).expect("read compiled guest wasm")
+    })
+}
+
+#[test]
+fn guest_continues_and_adds_response_header() {
+    let plugin = Plugin::from_bytes(guest_wasm(), Limits::default()).unwrap();
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Continue(0));
+    assert_eq!(
+        host.header_values(HeaderKind::Response, "x-greeted"),
+        vec!["true"]
+    );
+}
+
+#[test]
+fn guest_short_circuits_when_blocked() {
+    let plugin = Plugin::from_bytes(guest_wasm(), Limits::default()).unwrap();
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    }
+    .with_req_header("x-block", "yes");
+
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Stop);
+    assert_eq!(host.status_code(), 403);
+    assert_eq!(host.resp_body, b"blocked by guest");
+}

@@ -1,0 +1,17 @@
+[package]
+name = "http-wasm-host"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust host implementation of the http-wasm handler ABI, for running portable HTTP middleware compiled to WebAssembly."
+license = "MIT"
+repository = "https://github.com/kemeter/http-wasm"
+keywords = ["wasm", "http", "middleware", "wasmtime", "plugin"]
+categories = ["wasm", "web-programming"]
+readme = "README.md"
+
+[dependencies]
+wasmtime = "45.0.0"
+log = "0.4"
+
+[dev-dependencies]
+wat = "1"

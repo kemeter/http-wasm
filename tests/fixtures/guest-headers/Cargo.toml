@@ -1,0 +1,14 @@
+# Test-only guest. Not part of the workspace; built on demand by the host's
+# integration tests into a wasm32-unknown-unknown module.
+[package]
+name = "guest-headers"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
