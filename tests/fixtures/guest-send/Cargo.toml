@@ -1,0 +1,13 @@
+# Test-only guest exercising the http_send (fire-and-forget) extension.
+[package]
+name = "guest-send"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true

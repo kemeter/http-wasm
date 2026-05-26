@@ -44,6 +44,29 @@ pub trait Fetcher: Send + Sync {
     fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, String>;
 }
 
+/// Outcome of a fire-and-forget [`Sink::send`] enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The request was accepted into the queue.
+    Queued,
+    /// The queue is full; the request was dropped.
+    QueueFull,
+    /// The request was rejected (e.g. host not allowed).
+    Rejected,
+}
+
+/// Accepts a request to perform later, without blocking the guest. Implemented
+/// by the embedder (typically pushing onto a bounded queue drained by a
+/// background worker). Unlike [`Fetcher`], the guest never sees a response —
+/// this is fire-and-forget, for things like analytics beacons where adding the
+/// network round-trip to the request path would be wrong.
+///
+/// The embedder owns the policy here too: queue size, batching, and URL
+/// allow-listing (anti-SSRF).
+pub trait Sink: Send + Sync {
+    fn send(&self, request: FetchRequest) -> SendOutcome;
+}
+
 /// Wire format for `http_fetch`, kept dependency-free (no serde): a sequence of
 /// length-prefixed fields. All lengths are little-endian `u32`.
 ///

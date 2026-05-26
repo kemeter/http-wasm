@@ -126,6 +126,24 @@ fn fetch_guest_wasm() -> &'static [u8] {
     WASM.get_or_init(|| build_guest("guest-fetch", "guest_fetch"))
 }
 
+fn send_guest_wasm() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    WASM.get_or_init(|| build_guest("guest-send", "guest_send"))
+}
+
+/// Records every request the guest fires, so the test can inspect it.
+#[derive(Default)]
+struct RecordingSink {
+    sent: std::sync::Mutex<Vec<http_wasm_host::FetchRequest>>,
+}
+
+impl http_wasm_host::Sink for RecordingSink {
+    fn send(&self, request: http_wasm_host::FetchRequest) -> http_wasm_host::SendOutcome {
+        self.sent.lock().unwrap().push(request);
+        http_wasm_host::SendOutcome::Queued
+    }
+}
+
 /// A canned fetcher returning a fixed status, recording the request it saw.
 struct CannedFetcher {
     status: u16,
@@ -213,4 +231,30 @@ fn fetch_guest_allows_when_decision_api_permits() {
 
     let next = plugin.handle_request(&mut host).unwrap();
     assert_eq!(next, Next::Continue(0));
+}
+
+#[test]
+fn send_guest_fires_beacon_and_continues() {
+    use std::sync::Arc;
+    let sink = Arc::new(RecordingSink::default());
+    let plugin = Plugin::from_bytes(send_guest_wasm(), Limits::default())
+        .unwrap()
+        .with_sink(sink.clone());
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    // Guest continues regardless (fire-and-forget).
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Continue(0));
+
+    // …and the beacon reached the sink with the expected shape.
+    let sent = sink.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(sent[0].url, "http://collector/api/send");
+    assert_eq!(sent[0].body, br#"{"type":"event"}"#);
 }

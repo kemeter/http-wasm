@@ -7,7 +7,7 @@ use std::time::Duration;
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 
 use crate::abi::{self, HeaderKind, LogLevel};
-use crate::fetch::{Fetcher, codec};
+use crate::fetch::{Fetcher, SendOutcome, Sink, codec};
 use crate::host::Host;
 
 /// Errors surfaced while loading or running a guest.
@@ -69,6 +69,7 @@ pub struct Plugin {
     module: Module,
     limits: Limits,
     fetcher: Option<Arc<dyn Fetcher>>,
+    sink: Option<Arc<dyn Sink>>,
 }
 
 /// The store payload: a raw pointer to the embedder's `Host` for the duration
@@ -80,6 +81,7 @@ struct StoreData {
     memory: Option<Memory>,
     limiter: MemLimiter,
     fetcher: Option<Arc<dyn Fetcher>>,
+    sink: Option<Arc<dyn Sink>>,
 }
 
 struct MemLimiter {
@@ -118,6 +120,7 @@ impl Plugin {
             module,
             limits,
             fetcher: None,
+            sink: None,
         })
     }
 
@@ -126,6 +129,14 @@ impl Plugin {
     /// to instantiate (the import is unresolved) — opting in is explicit.
     pub fn with_fetcher(mut self, fetcher: Arc<dyn Fetcher>) -> Self {
         self.fetcher = Some(fetcher);
+        self
+    }
+
+    /// Enable the fire-and-forget extension: the guest's `http_send` imports are
+    /// handed to `sink`, which enqueues them without blocking. Opt-in, like
+    /// [`with_fetcher`](Self::with_fetcher).
+    pub fn with_sink(mut self, sink: Arc<dyn Sink>) -> Self {
+        self.sink = Some(sink);
         self
     }
 
@@ -187,6 +198,7 @@ impl Plugin {
                 max: self.limits.max_memory_bytes,
             },
             fetcher: self.fetcher.clone(),
+            sink: self.sink.clone(),
         };
         let mut store = Store::new(&self.engine, data);
         store.limiter(|d| &mut d.limiter);
@@ -196,6 +208,9 @@ impl Plugin {
         register_host_functions(&mut linker)?;
         if self.fetcher.is_some() {
             register_fetch_function(&mut linker)?;
+        }
+        if self.sink.is_some() {
+            register_send_function(&mut linker)?;
         }
 
         let instance = linker
@@ -512,6 +527,36 @@ fn register_fetch_function(linker: &mut Linker<StoreData>) -> Result<(), Error> 
                         abi::encode_count_len(1, full)
                     }
                     Err(_) => abi::encode_count_len(0, 0),
+                }
+            },
+        )
+        .map(|_| ())
+        .map_err(|err| Error::Load(err.to_string()))
+}
+
+/// Register the optional `http_send` extension (module `http_handler`).
+///
+/// ABI: `http_send(req_ptr, req_len) -> i32`. The guest writes a length-prefixed
+/// request (same codec as `http_fetch`) at `req_ptr`; the host hands it to the
+/// [`Sink`] which enqueues it without blocking. Returns the [`SendOutcome`] as
+/// an i32: 0 = queued, 1 = queue full, 2 = rejected, 3 = malformed request.
+fn register_send_function(linker: &mut Linker<StoreData>) -> Result<(), Error> {
+    linker
+        .func_wrap(
+            abi::MODULE,
+            "http_send",
+            |mut caller: Caller<'_, StoreData>, req_ptr: i32, req_len: i32| -> i32 {
+                let raw = read_mem(&mut caller, req_ptr, req_len);
+                let Some(request) = codec::decode_request(&raw) else {
+                    return 3; // malformed
+                };
+                let Some(sink) = caller.data().sink.clone() else {
+                    return 2; // no sink wired (shouldn't happen: only registered when set)
+                };
+                match sink.send(request) {
+                    SendOutcome::Queued => 0,
+                    SendOutcome::QueueFull => 1,
+                    SendOutcome::Rejected => 2,
                 }
             },
         )
