@@ -100,20 +100,48 @@ impl Host for TestHost {
     }
 }
 
-/// Compile the fixture guest once per test run and cache the wasm bytes.
+/// Compile a fixture guest and return its wasm bytes. `fixture` is the
+/// directory name under tests/fixtures and `lib` the produced module file stem.
+fn build_guest(fixture: &str, lib: &str) -> Vec<u8> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
+    let status = Command::new("cargo")
+        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .current_dir(&dir)
+        .status()
+        .expect("cargo build for guest");
+    assert!(status.success(), "guest build failed");
+    let wasm = dir.join(format!("target/wasm32-unknown-unknown/release/{lib}.wasm"));
+    std::fs::read(&wasm).expect("read compiled guest wasm")
+}
+
 fn guest_wasm() -> &'static [u8] {
     static WASM: OnceLock<Vec<u8>> = OnceLock::new();
-    WASM.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/guest-headers");
-        let status = Command::new("cargo")
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .current_dir(&dir)
-            .status()
-            .expect("cargo build for guest");
-        assert!(status.success(), "guest build failed");
-        let wasm = dir.join("target/wasm32-unknown-unknown/release/guest_headers.wasm");
-        std::fs::read(&wasm).expect("read compiled guest wasm")
-    })
+    WASM.get_or_init(|| build_guest("guest-headers", "guest_headers"))
+}
+
+fn fetch_guest_wasm() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    WASM.get_or_init(|| build_guest("guest-fetch", "guest_fetch"))
+}
+
+/// A canned fetcher returning a fixed status, recording the request it saw.
+struct CannedFetcher {
+    status: u16,
+}
+
+impl http_wasm_host::Fetcher for CannedFetcher {
+    fn fetch(
+        &self,
+        _request: http_wasm_host::FetchRequest,
+    ) -> Result<http_wasm_host::FetchResponse, String> {
+        Ok(http_wasm_host::FetchResponse {
+            status: self.status,
+            headers: vec![],
+            body: Vec::new(),
+        })
+    }
 }
 
 #[test]
@@ -149,4 +177,40 @@ fn guest_short_circuits_when_blocked() {
     assert_eq!(next, Next::Stop);
     assert_eq!(host.status_code(), 403);
     assert_eq!(host.resp_body, b"blocked by guest");
+}
+
+#[test]
+fn fetch_guest_blocks_when_decision_api_denies() {
+    use std::sync::Arc;
+    let plugin = Plugin::from_bytes(fetch_guest_wasm(), Limits::default())
+        .unwrap()
+        .with_fetcher(Arc::new(CannedFetcher { status: 403 }));
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Stop);
+    assert_eq!(host.status_code(), 403);
+    assert_eq!(host.resp_body, b"denied by decision api");
+}
+
+#[test]
+fn fetch_guest_allows_when_decision_api_permits() {
+    use std::sync::Arc;
+    let plugin = Plugin::from_bytes(fetch_guest_wasm(), Limits::default())
+        .unwrap()
+        .with_fetcher(Arc::new(CannedFetcher { status: 200 }));
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Continue(0));
 }

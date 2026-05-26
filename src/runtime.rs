@@ -1,11 +1,13 @@
 //! The wasmtime-backed runtime: compiles a guest once into a [`Plugin`], then
 //! drives the http-wasm phases against a [`Host`] for each request.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
 
 use crate::abi::{self, HeaderKind, LogLevel};
+use crate::fetch::{Fetcher, codec};
 use crate::host::Host;
 
 /// Errors surfaced while loading or running a guest.
@@ -66,6 +68,7 @@ pub struct Plugin {
     engine: Engine,
     module: Module,
     limits: Limits,
+    fetcher: Option<Arc<dyn Fetcher>>,
 }
 
 /// The store payload: a raw pointer to the embedder's `Host` for the duration
@@ -76,6 +79,7 @@ struct StoreData {
     host: *mut (dyn Host + 'static),
     memory: Option<Memory>,
     limiter: MemLimiter,
+    fetcher: Option<Arc<dyn Fetcher>>,
 }
 
 struct MemLimiter {
@@ -113,7 +117,16 @@ impl Plugin {
             engine,
             module,
             limits,
+            fetcher: None,
         })
+    }
+
+    /// Enable the outbound-HTTP extension: the guest's `http_fetch` imports are
+    /// served by `fetcher`. Without this, a guest importing `http_fetch` fails
+    /// to instantiate (the import is unresolved) — opting in is explicit.
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn Fetcher>) -> Self {
+        self.fetcher = Some(fetcher);
+        self
     }
 
     /// Run `handle_request` against `host`. The guest may mutate the request and
@@ -173,6 +186,7 @@ impl Plugin {
             limiter: MemLimiter {
                 max: self.limits.max_memory_bytes,
             },
+            fetcher: self.fetcher.clone(),
         };
         let mut store = Store::new(&self.engine, data);
         store.limiter(|d| &mut d.limiter);
@@ -180,6 +194,9 @@ impl Plugin {
 
         let mut linker: Linker<StoreData> = Linker::new(&self.engine);
         register_host_functions(&mut linker)?;
+        if self.fetcher.is_some() {
+            register_fetch_function(&mut linker)?;
+        }
 
         let instance = linker
             .instantiate(&mut store, &self.module)
@@ -459,4 +476,45 @@ fn register_host_functions(linker: &mut Linker<StoreData>) -> Result<(), Error> 
     ))?;
 
     Ok(())
+}
+
+/// Register the optional `http_fetch` extension (module `http_handler`).
+///
+/// ABI: `http_fetch(req_ptr, req_len, resp_ptr, resp_limit) -> i64`. The guest
+/// writes a length-prefixed request (see [`crate::fetch::codec`]) at `req_ptr`;
+/// the host performs it via the [`Fetcher`] and writes the encoded response at
+/// `resp_ptr`. The i64 return packs `(ok, len)`: `ok` (high 32 bits) is 1 on
+/// success / 0 on denial or error, `len` (low 32 bits) is the full encoded
+/// response length — if it exceeds `resp_limit` the guest re-calls with a
+/// bigger buffer, like the other sized ABI calls.
+fn register_fetch_function(linker: &mut Linker<StoreData>) -> Result<(), Error> {
+    linker
+        .func_wrap(
+            abi::MODULE,
+            "http_fetch",
+            |mut caller: Caller<'_, StoreData>,
+             req_ptr: i32,
+             req_len: i32,
+             resp_ptr: i32,
+             resp_limit: i32|
+             -> i64 {
+                let raw = read_mem(&mut caller, req_ptr, req_len);
+                let Some(request) = codec::decode_request(&raw) else {
+                    return abi::encode_count_len(0, 0);
+                };
+                let Some(fetcher) = caller.data().fetcher.clone() else {
+                    return abi::encode_count_len(0, 0);
+                };
+                match fetcher.fetch(request) {
+                    Ok(resp) => {
+                        let encoded = codec::encode_response(&resp);
+                        let full = write_capped(&mut caller, resp_ptr, resp_limit, &encoded);
+                        abi::encode_count_len(1, full)
+                    }
+                    Err(_) => abi::encode_count_len(0, 0),
+                }
+            },
+        )
+        .map(|_| ())
+        .map_err(|err| Error::Load(err.to_string()))
 }

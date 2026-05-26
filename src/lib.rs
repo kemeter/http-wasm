@@ -45,9 +45,11 @@
 //! ```
 
 mod abi;
+mod fetch;
 mod host;
 mod runtime;
 
 pub use abi::{HeaderKind, LogLevel, features};
+pub use fetch::{FetchRequest, FetchResponse, Fetcher};
 pub use host::Host;
 pub use runtime::{Error, Limits, Next, Plugin};
