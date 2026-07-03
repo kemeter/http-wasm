@@ -125,16 +125,19 @@ impl Plugin {
     }
 
     /// Enable the outbound-HTTP extension: the guest's `http_fetch` imports are
-    /// served by `fetcher`. Without this, a guest importing `http_fetch` fails
-    /// to instantiate (the import is unresolved) — opting in is explicit.
+    /// served by `fetcher`. The `http_fetch` import is always linked, so a guest
+    /// that imports it still instantiates without a fetcher; its calls just
+    /// return an error result (no request is made) until one is wired here.
     pub fn with_fetcher(mut self, fetcher: Arc<dyn Fetcher>) -> Self {
         self.fetcher = Some(fetcher);
         self
     }
 
     /// Enable the fire-and-forget extension: the guest's `http_send` imports are
-    /// handed to `sink`, which enqueues them without blocking. Opt-in, like
-    /// [`with_fetcher`](Self::with_fetcher).
+    /// handed to `sink`, which enqueues them without blocking. Like
+    /// [`with_fetcher`](Self::with_fetcher), the `http_send` import is always
+    /// linked; without a sink the guest still instantiates and its sends are
+    /// rejected (the event is dropped) until one is wired here.
     pub fn with_sink(mut self, sink: Arc<dyn Sink>) -> Self {
         self.sink = Some(sink);
         self
@@ -206,12 +209,15 @@ impl Plugin {
 
         let mut linker: Linker<StoreData> = Linker::new(&self.engine);
         register_host_functions(&mut linker)?;
-        if self.fetcher.is_some() {
-            register_fetch_function(&mut linker)?;
-        }
-        if self.sink.is_some() {
-            register_send_function(&mut linker)?;
-        }
+        // Always register the outbound extensions so a guest that imports
+        // `http_fetch`/`http_send` instantiates whether or not a fetcher/sink is
+        // wired. When none is configured the handlers no-op safely (fetch returns
+        // an error result, send returns "rejected"), so an event is dropped
+        // rather than trapping the whole request. Gating registration on
+        // `fetcher/sink.is_some()` left the import unresolved and every request
+        // through such a plugin failed to instantiate.
+        register_fetch_function(&mut linker)?;
+        register_send_function(&mut linker)?;
 
         let instance = linker
             .instantiate(&mut store, &self.module)
@@ -551,7 +557,7 @@ fn register_send_function(linker: &mut Linker<StoreData>) -> Result<(), Error> {
                     return 3; // malformed
                 };
                 let Some(sink) = caller.data().sink.clone() else {
-                    return 2; // no sink wired (shouldn't happen: only registered when set)
+                    return 2; // no sink configured: reject (drop the event)
                 };
                 match sink.send(request) {
                     SendOutcome::Queued => 0,
