@@ -258,3 +258,39 @@ fn send_guest_fires_beacon_and_continues() {
     assert_eq!(sent[0].url, "http://collector/api/send");
     assert_eq!(sent[0].body, br#"{"type":"event"}"#);
 }
+
+#[test]
+fn send_guest_instantiates_and_continues_without_a_sink() {
+    // A guest that imports `http_send` must still instantiate when no sink is
+    // wired: the import is always linked and the call is rejected (event
+    // dropped) instead of leaving the import unresolved, which would trap every
+    // request and surface as a 502 to clients.
+    let plugin = Plugin::from_bytes(send_guest_wasm(), Limits::default()).unwrap();
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    let next = plugin.handle_request(&mut host).unwrap();
+    assert_eq!(next, Next::Continue(0));
+}
+
+#[test]
+fn fetch_guest_instantiates_without_a_fetcher() {
+    // Same contract for the blocking `http_fetch` extension: importing it must
+    // not require a fetcher to instantiate. The guest blocks the request when
+    // the (absent) decision API does not permit it, i.e. the call returns an
+    // error result rather than trapping.
+    let plugin = Plugin::from_bytes(fetch_guest_wasm(), Limits::default()).unwrap();
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+
+    // Must not panic/trap; the guest reaches a decision on its own.
+    let _ = plugin.handle_request(&mut host).unwrap();
+}
