@@ -2,9 +2,11 @@
 //! drives the http-wasm phases against a [`Host`] for each request.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use wasmtime::{Caller, Engine, Linker, Memory, Module, Store};
+use wasmtime::{Caller, Engine, Instance, InstancePre, Linker, Memory, Store};
 
 use crate::abi::{self, HeaderKind, LogLevel};
 use crate::fetch::{Fetcher, SendOutcome, Sink, codec};
@@ -62,26 +64,81 @@ impl Default for Limits {
     }
 }
 
-/// A compiled guest, ready to run against many requests. Cheap to clone the
-/// underlying module; compile once and reuse.
+/// A compiled guest, ready to run against many requests. Compile once and
+/// share it (e.g. behind an `Arc`); phases may run concurrently.
 pub struct Plugin {
     engine: Engine,
-    module: Module,
+    /// The guest pre-linked against every host function, so a new instance
+    /// only costs the instantiation itself.
+    pre: InstancePre<StoreData>,
     limits: Limits,
     fetcher: Option<Arc<dyn Fetcher>>,
     sink: Option<Arc<dyn Sink>>,
+    /// Drives the timeout: advances the engine epoch at a fixed tick. Only held
+    /// so it stops (on drop) with the plugin.
+    _ticker: EpochTicker,
+    /// Epoch ticks granted to one phase call (the timeout, in ticks).
+    deadline_ticks: u64,
 }
 
-/// The store payload: a raw pointer to the embedder's `Host` for the duration
-/// of one phase call, plus the resolved guest memory. The pointer is only ever
-/// dereferenced synchronously inside host functions while `run_phase` holds the
-/// borrow, so it never dangles.
+/// One live guest instance and its store.
+struct Slot {
+    store: Store<StoreData>,
+    instance: Instance,
+}
+
+/// The store payload: a raw pointer to the embedder's `Host`, set only for the
+/// duration of one phase call, plus the resolved guest memory. The pointer is
+/// only ever dereferenced synchronously inside host functions while `run_phase`
+/// holds the borrow, and is cleared before the call returns, so it never
+/// dangles.
 struct StoreData {
-    host: *mut (dyn Host + 'static),
+    host: Option<*mut (dyn Host + 'static)>,
     memory: Option<Memory>,
     limiter: MemLimiter,
     fetcher: Option<Arc<dyn Fetcher>>,
     sink: Option<Arc<dyn Sink>>,
+}
+
+/// Background thread advancing the engine epoch every `tick`. Each call sets
+/// its own deadline relative to the current epoch, so a slow call only trips
+/// itself: a per-call watchdog bumping the shared epoch would also trip every
+/// other call running on the same engine at that moment.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine, tick: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(tick);
+                engine.increment_epoch();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Tick granularity for a given timeout: fine enough to keep the timeout
+/// accurate, coarse enough that the ticker costs nothing measurable.
+fn tick_for(timeout: Duration) -> Duration {
+    (timeout / 20).clamp(Duration::from_millis(1), Duration::from_millis(10))
 }
 
 struct MemLimiter {
@@ -114,13 +171,35 @@ impl Plugin {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| Error::Load(e.to_string()))?;
-        let module = Module::new(&engine, wasm).map_err(|e| Error::Load(e.to_string()))?;
+        let module =
+            wasmtime::Module::new(&engine, wasm).map_err(|e| Error::Load(e.to_string()))?;
+
+        let mut linker: Linker<StoreData> = Linker::new(&engine);
+        register_host_functions(&mut linker)?;
+        // Always register the outbound extensions so a guest that imports
+        // `http_fetch`/`http_send` instantiates whether or not a fetcher/sink is
+        // wired. When none is configured the handlers no-op safely (fetch returns
+        // an error result, send returns "rejected"), so an event is dropped
+        // rather than trapping the whole request. Gating registration on
+        // `fetcher/sink.is_some()` left the import unresolved and every request
+        // through such a plugin failed to instantiate.
+        register_fetch_function(&mut linker)?;
+        register_send_function(&mut linker)?;
+        register_clock_random_functions(&mut linker)?;
+        let pre = linker
+            .instantiate_pre(&module)
+            .map_err(|e| Error::Load(e.to_string()))?;
+
+        let tick = tick_for(limits.timeout);
+        let deadline_ticks = (limits.timeout.as_nanos() / tick.as_nanos()).max(1) as u64 + 1;
         Ok(Self {
+            _ticker: EpochTicker::start(engine.clone(), tick),
             engine,
-            module,
+            pre,
             limits,
             fetcher: None,
             sink: None,
+            deadline_ticks,
         })
     }
 
@@ -182,20 +261,10 @@ impl Plugin {
         })
     }
 
-    /// Shared setup: build a store wired to `host`, instantiate, resolve memory,
-    /// arm the timeout, then run `call`.
-    fn run_phase<R>(
-        &self,
-        host: &mut dyn Host,
-        call: impl FnOnce(&wasmtime::Instance, &mut Store<StoreData>) -> Result<R, Error>,
-    ) -> Result<R, Error> {
-        // Erase the lifetime to a raw pointer: the borrow is live for this whole
-        // function, and host functions only run synchronously within `call`.
-        let host_ptr: *mut (dyn Host + 'static) =
-            unsafe { std::mem::transmute::<*mut dyn Host, *mut (dyn Host + 'static)>(host) };
-
+    /// Build a new guest instance with its own store.
+    fn instantiate(&self) -> Result<Slot, Error> {
         let data = StoreData {
-            host: host_ptr,
+            host: None,
             memory: None,
             limiter: MemLimiter {
                 max: self.limits.max_memory_bytes,
@@ -205,45 +274,41 @@ impl Plugin {
         };
         let mut store = Store::new(&self.engine, data);
         store.limiter(|d| &mut d.limiter);
-        store.set_epoch_deadline(1);
+        // Instantiation runs the guest's start function: bound it too.
+        store.set_epoch_deadline(self.deadline_ticks);
 
-        let mut linker: Linker<StoreData> = Linker::new(&self.engine);
-        register_host_functions(&mut linker)?;
-        // Always register the outbound extensions so a guest that imports
-        // `http_fetch`/`http_send` instantiates whether or not a fetcher/sink is
-        // wired. When none is configured the handlers no-op safely (fetch returns
-        // an error result, send returns "rejected"), so an event is dropped
-        // rather than trapping the whole request. Gating registration on
-        // `fetcher/sink.is_some()` left the import unresolved and every request
-        // through such a plugin failed to instantiate.
-        register_fetch_function(&mut linker)?;
-        register_send_function(&mut linker)?;
-        register_clock_random_functions(&mut linker)?;
-
-        let instance = linker
-            .instantiate(&mut store, &self.module)
+        let instance = self
+            .pre
+            .instantiate(&mut store)
             .map_err(|e| Error::Load(e.to_string()))?;
-
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or(Error::MissingExport("memory"))?;
         store.data_mut().memory = Some(memory);
+        Ok(Slot { store, instance })
+    }
 
-        // Arm the timeout: a background thread bumps the engine epoch once the
-        // budget elapses, tripping the deadline mid-execution.
-        let engine = self.engine.clone();
-        let timeout = self.limits.timeout;
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            if rx.recv_timeout(timeout).is_err() {
-                engine.increment_epoch();
-            }
-        });
+    /// Shared setup: get an instance wired to `host`, arm the timeout, then run
+    /// `call`.
+    fn run_phase<R>(
+        &self,
+        host: &mut dyn Host,
+        call: impl FnOnce(&Instance, &mut Store<StoreData>) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        // Erase the lifetime to a raw pointer: the borrow is live for this whole
+        // function, host functions only run synchronously within `call`, and the
+        // pointer is cleared before returning.
+        let host_ptr: *mut (dyn Host + 'static) =
+            unsafe { std::mem::transmute::<*mut dyn Host, *mut (dyn Host + 'static)>(host) };
 
-        let result = call(&instance, &mut store);
+        let mut slot = self.instantiate()?;
+        slot.store.data_mut().host = Some(host_ptr);
+        // Relative to the current epoch: only this call's own budget counts.
+        slot.store.set_epoch_deadline(self.deadline_ticks);
 
-        let _ = tx.send(()); // tell the watchdog we finished in time
-        let _ = watchdog.join();
+        let result = call(&slot.instance, &mut slot.store);
+
+        slot.store.data_mut().host = None;
         result
     }
 }
@@ -252,7 +317,10 @@ impl Plugin {
 /// function: `run_phase` keeps the original `&mut dyn Host` alive and never
 /// aliases it (host functions are synchronous and non-reentrant here).
 fn host_of<'a>(caller: &'a mut Caller<'_, StoreData>) -> &'a mut dyn Host {
-    let ptr = caller.data().host;
+    let ptr = caller
+        .data()
+        .host
+        .expect("host is set for the duration of a phase call");
     unsafe { &mut *ptr }
 }
 
