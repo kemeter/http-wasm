@@ -1,5 +1,5 @@
-//! Runtime behaviour independent of any fixture crate: instance lifecycle and
-//! the per-call timeout. The guest is inline WAT; it counts its calls in a global
+//! Runtime behaviour independent of any fixture crate: instance reuse and the
+//! per-call timeout. The guest is inline WAT; it counts its calls in a global
 //! (reported as the status code) and picks a behaviour from the request method:
 //! `SPIN` loops forever, `WORK` burns a few milliseconds, `TRAP` traps after
 //! counting, anything else returns at once.
@@ -104,6 +104,24 @@ fn calls_seen(plugin: &Plugin, method: &str) -> Result<u32, Error> {
 fn fresh_instance_per_call_by_default() {
     let plugin = plugin(Limits::default());
     assert_eq!(calls_seen(&plugin, "GET").unwrap(), 1);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 1);
+}
+
+#[test]
+fn reused_instance_keeps_guest_state() {
+    let plugin = plugin(Limits::default()).with_instance_reuse(1);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 1);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 2);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 3);
+}
+
+#[test]
+fn trapped_instance_is_not_reused() {
+    let plugin = plugin(Limits::default()).with_instance_reuse(1);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 1);
+    assert_eq!(calls_seen(&plugin, "GET").unwrap(), 2);
+    assert!(matches!(calls_seen(&plugin, "TRAP"), Err(Error::Run(_))));
+    // The trapped instance (count 3) was dropped: a fresh one starts over.
     assert_eq!(calls_seen(&plugin, "GET").unwrap(), 1);
 }
 

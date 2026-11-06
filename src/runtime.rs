@@ -1,8 +1,8 @@
 //! The wasmtime-backed runtime: compiles a guest once into a [`Plugin`], then
 //! drives the http-wasm phases against a [`Host`] for each request.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -79,6 +79,10 @@ pub struct Plugin {
     _ticker: EpochTicker,
     /// Epoch ticks granted to one phase call (the timeout, in ticks).
     deadline_ticks: u64,
+    /// Idle instances kept for reuse, when enabled (see
+    /// [`Plugin::with_instance_reuse`]); `max_idle == 0` disables reuse.
+    pool: Mutex<Vec<Slot>>,
+    max_idle: usize,
 }
 
 /// One live guest instance and its store.
@@ -91,7 +95,7 @@ struct Slot {
 /// duration of one phase call, plus the resolved guest memory. The pointer is
 /// only ever dereferenced synchronously inside host functions while `run_phase`
 /// holds the borrow, and is cleared before the call returns, so it never
-/// dangles.
+/// dangles — even when the store is kept for reuse.
 struct StoreData {
     host: Option<*mut (dyn Host + 'static)>,
     memory: Option<Memory>,
@@ -99,6 +103,12 @@ struct StoreData {
     fetcher: Option<Arc<dyn Fetcher>>,
     sink: Option<Arc<dyn Sink>>,
 }
+
+// SAFETY: the only non-Send field is the `Host` pointer, which is `Some` only
+// while a phase call runs on the thread that owns the borrow, and is reset to
+// `None` before the store goes back to the pool (where another thread may pick
+// it up).
+unsafe impl Send for StoreData {}
 
 /// Background thread advancing the engine epoch every `tick`. Each call sets
 /// its own deadline relative to the current epoch, so a slow call only trips
@@ -200,7 +210,23 @@ impl Plugin {
             fetcher: None,
             sink: None,
             deadline_ticks,
+            pool: Mutex::new(Vec::new()),
+            max_idle: 0,
         })
+    }
+
+    /// Keep up to `max_idle` guest instances alive between phase calls and
+    /// reuse them, instead of instantiating a fresh guest for every call.
+    ///
+    /// This lets a guest keep state across requests — typically a cache built
+    /// from its config, which would otherwise be rebuilt on every request.
+    /// The guest must then tolerate state left by previous calls (and possibly
+    /// by other routes sharing the plugin with a different config). An
+    /// instance whose call fails (trap, timeout) is discarded, never reused.
+    /// `0` (the default) keeps the fresh-instance-per-call behaviour.
+    pub fn with_instance_reuse(mut self, max_idle: usize) -> Self {
+        self.max_idle = max_idle;
+        self
     }
 
     /// Enable the outbound-HTTP extension: the guest's `http_fetch` imports are
@@ -288,6 +314,29 @@ impl Plugin {
         Ok(Slot { store, instance })
     }
 
+    /// An idle pooled instance if reuse is enabled and one is available,
+    /// otherwise a fresh one.
+    fn checkout(&self) -> Result<Slot, Error> {
+        if self.max_idle > 0
+            && let Some(slot) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        {
+            return Ok(slot);
+        }
+        self.instantiate()
+    }
+
+    /// Return a healthy instance to the pool (dropped if reuse is off or the
+    /// pool is full).
+    fn checkin(&self, slot: Slot) {
+        if self.max_idle == 0 {
+            return;
+        }
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < self.max_idle {
+            pool.push(slot);
+        }
+    }
+
     /// Shared setup: get an instance wired to `host`, arm the timeout, then run
     /// `call`.
     fn run_phase<R>(
@@ -301,7 +350,7 @@ impl Plugin {
         let host_ptr: *mut (dyn Host + 'static) =
             unsafe { std::mem::transmute::<*mut dyn Host, *mut (dyn Host + 'static)>(host) };
 
-        let mut slot = self.instantiate()?;
+        let mut slot = self.checkout()?;
         slot.store.data_mut().host = Some(host_ptr);
         // Relative to the current epoch: only this call's own budget counts.
         slot.store.set_epoch_deadline(self.deadline_ticks);
@@ -309,6 +358,9 @@ impl Plugin {
         let result = call(&slot.instance, &mut slot.store);
 
         slot.store.data_mut().host = None;
+        if result.is_ok() {
+            self.checkin(slot);
+        }
         result
     }
 }
