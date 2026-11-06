@@ -52,6 +52,23 @@ match plugin.handle_request(&mut host)? {
   interruption (a watchdog trips the deadline if a guest spins).
 - `max_memory_bytes` — hard cap on guest linear memory growth.
 
+## Instance reuse
+
+By default every phase call runs in a fresh guest instance: nothing survives
+between requests. A guest that builds something expensive from its config (a
+routing table, a compiled ruleset) would rebuild it on every request. Opt in to
+keep instances alive and reuse them:
+
+```rust
+let plugin = Plugin::from_bytes(&wasm_bytes, Limits::default())?
+    .with_instance_reuse(8); // keep up to 8 idle instances
+# Ok::<(), http_wasm_host::Error>(())
+```
+
+The guest then sees the state left by earlier calls, so it must not assume a
+clean slate (and should key any cache on its config if several configs share
+the plugin). An instance whose call fails — trap or timeout — is discarded.
+
 ## Outbound HTTP extension (`http_fetch`)
 
 The base http-wasm spec gives a guest no way to make a network call. This crate
