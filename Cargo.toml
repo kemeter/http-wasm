@@ -10,9 +10,9 @@ categories = ["wasm", "web-programming"]
 readme = "README.md"
 
 [dependencies]
-wasmtime = "45.0.0"
+wasmtime = "50.0.1"
 log = "0.4"
-getrandom = "0.3"
+getrandom = "0.4"
 
 [dev-dependencies]
 wat = "1"
