@@ -131,6 +131,11 @@ fn send_guest_wasm() -> &'static [u8] {
     WASM.get_or_init(|| build_guest("guest-send", "guest_send"))
 }
 
+fn clock_guest_wasm() -> &'static [u8] {
+    static WASM: OnceLock<Vec<u8>> = OnceLock::new();
+    WASM.get_or_init(|| build_guest("guest-clock", "guest_clock"))
+}
+
 /// Records every request the guest fires, so the test can inspect it.
 #[derive(Default)]
 struct RecordingSink {
@@ -293,4 +298,60 @@ fn fetch_guest_instantiates_without_a_fetcher() {
 
     // Must not panic/trap; the guest reaches a decision on its own.
     let _ = plugin.handle_request(&mut host).unwrap();
+}
+
+/// Run the clock guest once and return its single-valued response headers.
+fn run_clock_guest(plugin: &Plugin) -> HashMap<String, String> {
+    let mut host = TestHost {
+        method: "GET".into(),
+        uri: "/".into(),
+        status: 200,
+        ..Default::default()
+    };
+    assert_eq!(plugin.handle_request(&mut host).unwrap(), Next::Continue(0));
+    host.resp_headers
+        .into_iter()
+        .map(|(name, mut values)| (name, values.remove(0)))
+        .collect()
+}
+
+#[test]
+fn clock_guest_reads_host_wall_clock() {
+    let plugin = Plugin::from_bytes(clock_guest_wasm(), Limits::default()).unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let headers = run_clock_guest(&plugin);
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let reported: u128 = headers["x-time"].parse().unwrap();
+    assert!(
+        (before..=after).contains(&reported),
+        "guest time {reported} not within [{before}, {after}]"
+    );
+}
+
+#[test]
+fn clock_guest_gets_fresh_random_bytes_per_request() {
+    let plugin = Plugin::from_bytes(clock_guest_wasm(), Limits::default()).unwrap();
+    let first = run_clock_guest(&plugin);
+    let second = run_clock_guest(&plugin);
+
+    assert_eq!(first["x-random-ok"], "1");
+    assert_eq!(first["x-random"].len(), 32);
+    // Each phase runs in a fresh instance, so identical output would mean the
+    // bytes are not coming from the host.
+    assert_ne!(first["x-random"], second["x-random"]);
+    assert_ne!(first["x-random"], "0".repeat(32));
+}
+
+#[test]
+fn get_random_refuses_out_of_bounds_range_without_trapping() {
+    let plugin = Plugin::from_bytes(clock_guest_wasm(), Limits::default()).unwrap();
+    let headers = run_clock_guest(&plugin);
+    assert_eq!(headers["x-random-oob"], "0");
 }

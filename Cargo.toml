@@ -12,6 +12,7 @@ readme = "README.md"
 [dependencies]
 wasmtime = "45.0.0"
 log = "0.4"
+getrandom = "0.3"
 
 [dev-dependencies]
 wat = "1"

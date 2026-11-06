@@ -110,6 +110,21 @@ let plugin = Plugin::from_bytes(&wasm_bytes, Limits::default())?
 # Ok::<(), http_wasm_host::Error>(())
 ```
 
+## Clock and randomness extensions (`get_time_unix_nanos`, `get_random`)
+
+A `wasm32-unknown-unknown` guest has no clock and no entropy source, and each
+phase runs in a fresh instance, so it cannot carry a PRNG state between
+requests either. Two **optional, non-standard** host functions fill that gap,
+served directly by the host OS (no embedder wiring needed):
+
+| Function | Description |
+|---|---|
+| `get_time_unix_nanos() -> i64` | Wall-clock time in nanoseconds since the Unix epoch. |
+| `get_random(buf, len) -> i32` | Fills `len` bytes at `buf` with cryptographically secure random bytes. Returns 1 on success, 0 on failure or out-of-bounds range (buffer untouched). |
+
+Both are always linked, so a guest importing them instantiates on any host
+built from this crate.
+
 ## Writing a guest
 
 A guest imports the host functions from the module `http_handler` and exports
