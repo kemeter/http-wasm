@@ -218,6 +218,7 @@ impl Plugin {
         // through such a plugin failed to instantiate.
         register_fetch_function(&mut linker)?;
         register_send_function(&mut linker)?;
+        register_clock_random_functions(&mut linker)?;
 
         let instance = linker
             .instantiate(&mut store, &self.module)
@@ -564,6 +565,61 @@ fn register_send_function(linker: &mut Linker<StoreData>) -> Result<(), Error> {
                     SendOutcome::QueueFull => 1,
                     SendOutcome::Rejected => 2,
                 }
+            },
+        )
+        .map(|_| ())
+        .map_err(|err| Error::Load(err.to_string()))
+}
+
+/// Register the optional clock and randomness extensions (module
+/// `http_handler`).
+///
+/// A guest built for `wasm32-unknown-unknown` has no clock and no entropy
+/// source of its own, and every phase runs in a fresh instance, so it cannot
+/// even carry a PRNG state across requests. These functions give it both,
+/// served by the host OS. Like the outbound extensions they are always linked
+/// and need no embedder wiring.
+///
+/// ABI:
+/// - `get_time_unix_nanos() -> i64`: wall-clock time as nanoseconds since the
+///   Unix epoch (0 if the host clock is before the epoch).
+/// - `get_random(buf, len) -> i32`: fill `len` bytes at `buf` with
+///   cryptographically secure random bytes. Returns 1 on success, 0 if the
+///   host could not produce entropy or the range is outside guest memory (the
+///   buffer is then left untouched).
+fn register_clock_random_functions(linker: &mut Linker<StoreData>) -> Result<(), Error> {
+    linker
+        .func_wrap(
+            abi::MODULE,
+            "get_time_unix_nanos",
+            |_caller: Caller<'_, StoreData>| -> i64 {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|err| Error::Load(err.to_string()))?;
+    linker
+        .func_wrap(
+            abi::MODULE,
+            "get_random",
+            |mut caller: Caller<'_, StoreData>, buf: i32, len: i32| -> i32 {
+                let Ok(len) = usize::try_from(len) else {
+                    return 0;
+                };
+                let mem = memory_of(&mut caller);
+                let in_bounds = (buf as u32 as usize)
+                    .checked_add(len)
+                    .is_some_and(|end| end <= mem.data_size(&caller));
+                if !in_bounds {
+                    return 0;
+                }
+                let mut bytes = vec![0u8; len];
+                if getrandom::fill(&mut bytes).is_err() {
+                    return 0;
+                }
+                mem.write(&mut caller, buf as u32 as usize, &bytes).is_ok() as i32
             },
         )
         .map(|_| ())
